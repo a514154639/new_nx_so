@@ -8,6 +8,11 @@
 #include "common.hpp"
 #include "preprocess.h"
 #include "yolov5.h"
+#include <opencv2/opencv.hpp>
+// #include <thread>
+// #include <queue>
+// #include <mutex>
+// #include <condition_variable>
 // #include <time.h>
 
 #define USE_INT8  // set USE_INT8 or USE_FP16 or USE_FP32
@@ -23,6 +28,7 @@ const char* OUTPUT_BLOB_NAME = "prob";
 
 static uint8_t* img_host = nullptr;
 static uint8_t* img_device = nullptr;
+
 static cudaStream_t stream;
 // IExecutionContext* context = nullptr;
 IRuntime* runtime = nullptr;
@@ -39,6 +45,18 @@ cv::VideoCapture videos[NUM_VIDEOS];
 std::map<int,std::string> url_map;
 std::vector<int> emptyFrameCount(NUM_VIDEOS,0);
 std::vector<cv::Mat> cam_map(NUM_VIDEOS);
+//cv::Mat frame;
+
+// struct bufferItem
+// {
+//     cv::Mat frame;                // 原始图像
+//     std::vector<Yolo::Detection> bboxs; // 检测结果
+// };
+
+// std::queue<bufferItem> stage_buffer; //推理和后处理之间的缓存
+// std::mutex stage_mutex; //推理和后处理之间的互斥锁
+// std::condition_variable stage_not_full; //两个阶段之间的not full变量
+// std::condition_variable stage_not_empty; //两个阶段之间的not empty变量
 
 class Logger : public nvinfer1::ILogger
 {
@@ -71,14 +89,44 @@ void doInference(IExecutionContext& context, cudaStream_t& stream, void **buffer
     cudaStreamSynchronize(stream);
 }
 
+
+// 推理函数
+void inference(cv::Mat &img, IExecutionContext *context, cudaStream_t stream, void** buffers, float* prob, float& waste_time) {  
+    float* buffer_idx = (float*)buffers[inputIndex];
+    preprocess_kernel_img(img_device, img.cols, img.rows, buffer_idx, Yolo::INPUT_H, Yolo::INPUT_W, stream);
+    auto start = std::chrono::system_clock::now();
+    doInference(*context, stream, buffers, prob, BATCH_SIZE);
+    auto end = std::chrono::system_clock::now();
+    waste_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+}
+
+// 后处理函数
+void postprocess(cv::Mat& img, DetectRes* res, int* resNum, std::vector<Yolo::Detection>& result, float* prob) {
+    nms(result, prob, CONF_THRESH, NMS_THRESH);  
+    std::vector<DetectRes> res_vec(10);
+    int j = 0;
+    for (; j < result.size(); j++) {
+        cv::Rect r = get_rect(img, result[j].bbox);
+        //cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 5);
+        //cv::putText(img, std::to_string((int)result[j].class_id), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
+        DetectRes det(result[j].class_id, result[j].conf, Rect{r.x, r.y, r.width, r.height});
+        //std::cout <<"label: "<< result[j].class_id << " confidence: " << result[j].conf << std::endl;     
+        res_vec[j] = det;
+	}
+    *resNum = j;
+    std::copy(res_vec.begin(), res_vec.end(), res);
+
+}
+
+
 IExecutionContext* infer_init(const ModelParam& model_param)
 {
     IExecutionContext* context = nullptr;
-    // if(strlen(model_param.modelPath) == 0)
-    // {
-    //     std::cerr << "param value error!" << std::endl;
-    //     return 0;
-    // }
+    if(strlen(model_param.modelPath) == 0)
+    {
+        std::cerr << "param value error!" << std::endl;
+        return 0;
+    }
     
 	Yolo::CLASS_NUM = model_param.classesNum;
 	Yolo::INPUT_H = model_param.inputHeight;
@@ -88,10 +136,10 @@ IExecutionContext* infer_init(const ModelParam& model_param)
 	
     // deserialize the .engine and run inference
     std::ifstream file(model_param.modelPath, std::ios::binary);
-    // if (!file.good()) {
-    //     std::cerr << "read " << model_param.modelPath << " error!" << std::endl;
-    //     return 0;
-    // }
+    if (!file.good()) {
+        std::cerr << "read " << model_param.modelPath << " error!" << std::endl;
+        return 0;
+    }
     char *trtModelStream = nullptr;
     size_t size = 0;
     file.seekg(0, file.end);
@@ -111,6 +159,7 @@ IExecutionContext* infer_init(const ModelParam& model_param)
     assert(context != nullptr);
     delete[] trtModelStream;
     assert(engine->getNbBindings() == 2);
+
     // In order to bind the buffers, we need to know the names of the input and output tensors.
     // Note that indices are guaranteed to be less than IEngine::getNbBindings()
     inputIndex = engine->getBindingIndex(INPUT_BLOB_NAME);
@@ -174,6 +223,7 @@ IExecutionContext* infer_init_640(const ModelParam& model_param)
     assert(context != nullptr);
     delete[] trtModelStream;
     assert(engine->getNbBindings() == 2);
+
     // In order to bind the buffers, we need to know the names of the input and output tensors.
     // Note that indices are guaranteed to be less than IEngine::getNbBindings()
     inputIndex = engine->getBindingIndex(INPUT_BLOB_NAME);
@@ -181,7 +231,7 @@ IExecutionContext* infer_init_640(const ModelParam& model_param)
     assert(inputIndex == 0);
     assert(outputIndex == 1);
     // Create GPU buffers on device
-    CUDA_CHECK(cudaMalloc((void**)&buffers[inputIndex], BATCH_SIZE * 3 * Yolo::INPUT_H * Yolo::INPUT_W * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&buffers[inputIndex], BATCH_SIZE * 3 * Yolo::INPUT_W * Yolo::INPUT_H * sizeof(float)));
     CUDA_CHECK(cudaMalloc((void**)&buffers[outputIndex], BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
 
     // Create stream
@@ -199,19 +249,106 @@ IExecutionContext* infer_init_640(const ModelParam& model_param)
     // return 1;
 }
 
-int infer_run_one_640(unsigned char *image1, int row, int clomn, DetectRes* res, int *resNum, float *waste, IExecutionContext *context)
+
+// 调整的infer_run_one_index函数以使用线程
+// int infer_run_one_index_thread(cv::Mat &img, DetectRes* res, int *resNum, float *waste, IExecutionContext *context) {
+//     if (img.empty())
+//     {
+//         std::cerr << "input img is empty." << std::endl;
+//         return 0;
+//     }
+//     //std::cout<< "start convert mat..." <<std::endl;
+//     size_t size_image = img.cols * img.rows * 3;
+//     //size_t  size_image_dst = Yolo::INPUT_H * Yolo::INPUT_W * 3;
+//     float* buffer_idx = (float*)buffers[inputIndex];
+
+//     // allocate memory for res, resNum and waste
+//     int res_num = 0;
+//     float waste_time = 0.0f;
+
+//     //copy data to pinned memory
+//     memcpy(img_host, img.data, size_image);
+
+//     //copy data to device memory
+//     CUDA_CHECK(cudaMemcpyAsync(img_device, img_host, size_image, cudaMemcpyHostToDevice, stream));
+//     preprocess_kernel_img(img_device, img.cols, img.rows, buffer_idx, Yolo::INPUT_H, Yolo::INPUT_W, stream);
+
+//     static float prob[BATCH_SIZE * OUTPUT_SIZE];
+
+//     // 分别为前处理、推理、后处理创建线程
+//     //std::thread th_preprocess(preprocess, std::ref(img), img_device, img_host, stream, buffer_idx, size_image);
+//     std::thread th_inference(inference, context, stream, (void**)buffers, prob, std::ref(waste_time));
+
+//     // 确保前处理和推理完成后再进行后处理
+//     //th_preprocess.join();
+//     th_inference.join();
+//     //std::cout << "inference time: " << waste_time << "ms" << std::endl;
+
+//     // 由于后处理通常依赖推理结果，我们在推理线程之后同步执行它们，也可以考虑异步执行，如果后处理操作可以并行化
+//     std::vector<Yolo::Detection> result;
+//     result.reserve(10);
+//     std::thread th_postprocess(postprocess, std::ref(img), res, resNum, std::ref(result), prob);
+    
+//     th_postprocess.join();
+
+//     *waste = waste_time; // 这里只记录推理时间，你可以根据需要记录总时间
+//     //cv::imwrite("infer.jpg", img);
+//     return 1;
+// }
+
+// int infer_run_one_640_thread(cv::Mat &img, DetectRes* res, int *resNum, float *waste, IExecutionContext *context) {
+//     if (img.empty())
+//     {
+//         std::cerr << "input img is empty." << std::endl;
+//         return 0;
+//     }
+//     //std::cout<< "start convert mat..." <<std::endl;
+//     size_t size_image = img.cols * img.rows * 3;
+//     //size_t  size_image_dst = Yolo::INPUT_H * Yolo::INPUT_W * 3;
+
+//     // allocate memory for res, resNum and waste
+//     //
+//     int res_num = 0;
+//     float waste_time = 0.0f;
+
+//     //copy data to pinned memory
+//     memcpy(img_host, img.data, size_image);
+
+//     //copy data to device memory
+//     CUDA_CHECK(cudaMemcpyAsync(img_device, img_host, size_image, cudaMemcpyHostToDevice, stream));
+    
+
+//     static float prob[BATCH_SIZE * OUTPUT_SIZE];
+
+//     // 分别为前处理、推理、后处理创建线程
+//     //std::thread th_preprocess(preprocess, std::ref(img), img_device, img_host, stream, buffer_idx, size_image);
+//     std::thread th_inference(inference, context, stream, (void**)buffers, prob, std::ref(waste_time));
+
+//     // 确保前处理和推理完成后再进行后处理
+//     //th_preprocess.join();
+//     th_inference.join();
+//     //std::cout << "inference time: " << waste_time << "ms" << std::endl;
+
+//     // 由于后处理通常依赖推理结果，我们在推理线程之后同步执行它们，也可以考虑异步执行，如果后处理操作可以并行化
+//     std::vector<Yolo::Detection> result;
+//     result.reserve(10);
+//     std::thread th_postprocess(postprocess, std::ref(img), res, resNum, std::ref(result), prob);
+    
+//     th_postprocess.join();
+
+//     *waste = waste_time; // 这里只记录推理时间，你可以根据需要记录总时间
+//     //cv::imwrite("infer.jpg", img);
+//     return 1;
+// }
+
+int infer_run_one_640(cv::Mat &img, DetectRes* res, int *resNum, float *waste, IExecutionContext *context)
 {
-    //std::cout<< "runing infer..." <<std::endl;
-    cv::Mat img=cv::Mat::zeros(row, clomn, CV_8UC3);
-    //std::cout<< "index:" << (int)img.cols * img.rows * 3 <<std::endl;
-    std::memcpy(img.data, image1, (int)img.cols * img.rows * 3);
-    //std::cout<< "img:" << img.size() <<std::endl;
-    // cv::Mat img=cv::Mat(1920,1080,CV_8UC3,image1);
     if (img.empty())
     {
         std::cerr << "input img is empty." << std::endl;
         return 0;
     }
+    //cv::imwrite("infer_test_640.jpg", img);
     size_t size_image = img.cols * img.rows * 3;
     //size_t  size_image_dst = Yolo::INPUT_H * Yolo::INPUT_W * 3;
     float* buffer_idx = (float*)buffers[inputIndex];
@@ -228,7 +365,7 @@ int infer_run_one_640(unsigned char *image1, int row, int clomn, DetectRes* res,
     //std::cout<< "copy data to device memory..." <<std::endl;
     //copy data to device memory
     CUDA_CHECK(cudaMemcpyAsync(img_device, img_host, size_image, cudaMemcpyHostToDevice, stream));
-    preprocess_kernel_img(img_device, img.cols, img.rows, buffer_idx, Yolo::INPUT_W, Yolo::INPUT_H, stream);
+    preprocess_kernel_img(img_device, img.cols, img.rows, buffer_idx, 640, 640, stream);
 
     // Run inference
     auto start = std::chrono::system_clock::now();
@@ -238,7 +375,7 @@ int infer_run_one_640(unsigned char *image1, int row, int clomn, DetectRes* res,
     auto end = std::chrono::system_clock::now();
     waste_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-    // std::cout << "inference time: " << waste_time << "ms" << std::endl;
+    std::cout << "inference time: " << waste_time << "ms" << std::endl;
     std::vector<Yolo::Detection> result;
     result.reserve(10);
     nms(result, prob, CONF_THRESH, NMS_THRESH);
@@ -246,17 +383,17 @@ int infer_run_one_640(unsigned char *image1, int row, int clomn, DetectRes* res,
     int j = 0;
     for (; j < result.size(); j++) {
         cv::Rect r = get_rect(img, result[j].bbox);
-        // cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 5);
-        // cv::putText(img, std::to_string((int)result[j].class_id), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
+        cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 5);
+        cv::putText(img, std::to_string((int)result[j].class_id), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
         DetectRes det(result[j].class_id, result[j].conf, Rect{r.x, r.y, r.width, r.height});
-        //std::cout <<"label: "<< result[j].class_id << " confidence: " << result[j].conf << " location:" << (r.x + r.width)/2 << ","<< (r.y + r.height)/2 <<" top:"<< r.y <<" bottom:" << r.y+r.height <<std::endl;
+        std::cout <<"label: "<< result[j].class_id << " confidence: " << result[j].conf << " location:" << (r.x + r.width)/2 << ","<< (r.y + r.height)/2 <<" top:"<< r.y <<" bottom:" << r.y+r.height <<std::endl;
         res_vec[j] = det;
     }
     res_num = j;
     //std::cout<< "copy result..." <<std::endl;
     // assign the results to the output variables
     std::copy(res_vec.begin(), res_vec.end(), res);
-
+    cv::imwrite("infer_640.jpg", img);
     //*res = res_vec.data();
     *resNum = res_num;
     *waste = waste_time;
@@ -265,16 +402,12 @@ int infer_run_one_640(unsigned char *image1, int row, int clomn, DetectRes* res,
 }
 
 
+
 int infer_run_one(unsigned char *image1,int row,int clomn, DetectRes* res, int *resNum, float *waste, IExecutionContext *context)
 {
-    //std::cout<< "runing infer..." <<std::endl;
     cv::Mat img=cv::Mat::zeros(row, clomn, CV_8UC3);
-    //cv::Mat img=cv::Mat::zeros(2560, 1440, CV_8UC3);
-    //std::cout<< "index:" << (int)img.cols * img.rows * 3 <<std::endl;
     std::memcpy(img.data, image1, (int)img.cols * img.rows * 3);
-    //std::cout<< "img:" << img.size() <<std::endl;
-    // cv::Mat img=cv::Mat(1920,1080,CV_8UC3,image1);
-    //img = img(cv::Range(0, img.rows), cv::Range(100, img.cols));
+
     if (img.empty())
     {
         std::cerr << "input img is empty." << std::endl;
@@ -288,16 +421,15 @@ int infer_run_one(unsigned char *image1,int row,int clomn, DetectRes* res, int *
     //copy data to device memory
     CUDA_CHECK(cudaMemcpyAsync(img_device,img_host,size_image,cudaMemcpyHostToDevice,stream));
     //img preprocess
-    preprocess_kernel_img(img_device, img.cols, img.rows, buffer_idx, Yolo::INPUT_W, Yolo::INPUT_H, stream);
+    preprocess_kernel_img(img_device, img.cols, img.rows, buffer_idx, 416, 416, stream);
     
-  	// Run inference
-    
+  	// Run inference    
   	auto start = std::chrono::system_clock::now();
   	static float prob[BATCH_SIZE * OUTPUT_SIZE];
   	doInference(*context, stream, (void**)buffers, prob, BATCH_SIZE);
   	auto end = std::chrono::system_clock::now();
   	*waste = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    // std::cout << "inference time: " << *waste << "ms" << std::endl;
+    std::cout << "inference time: " << *waste << "ms" << std::endl;
     std::vector<Yolo::Detection> result;
     result.reserve(10);
     nms(result, prob, CONF_THRESH, NMS_THRESH);
@@ -313,20 +445,12 @@ int infer_run_one(unsigned char *image1,int row,int clomn, DetectRes* res, int *
 	}
 	*resNum = j;
     std::memcpy(image1, img.data, (int)img.cols * img.rows * 3);
-    // if (result.size()> 0){
-    //     char name[256] = {0};
-    //     time_t timep;
-    //     struct tm *p;
-    //     time(&timep);
-    //     p = localtime(&timep);
-    //     sprintf(name, "%d_%d_%d_%d_%02d.jpg",1900+p->tm_year,1+p->tm_mon,p->tm_mday,p->tm_hour,p->tm_min);
-    //     cv::imwrite(name, img);
-    // }
+
 	return 1;
 }
 
 
-int infer_run_one_index(int index, DetectRes* res, int *resNum, float *waste, IExecutionContext *context, int startpix)
+int infer_run_one_index_old(int index, DetectRes* res, int *resNum, float *waste, IExecutionContext *context, int startpix)
 {   
     //std::cout<< "runing infer..." <<std::endl;
     //cv::Mat img=cv::Mat::zeros(row, clomn, CV_8UC3);
@@ -372,6 +496,63 @@ int infer_run_one_index(int index, DetectRes* res, int *resNum, float *waste, IE
 	}
 	*resNum = j;
 	return 1;
+}
+
+int infer_run_one_index(cv::Mat &img, DetectRes* res, int *resNum, float *waste, IExecutionContext *context)
+{
+    if (img.empty())
+    {
+        std::cerr << "input img is empty." << std::endl;
+        return 0;
+    }
+    //std::cout<< "start convert mat..." <<std::endl;
+    size_t size_image = img.cols * img.rows * 3;
+    //size_t  size_image_dst = Yolo::INPUT_H * Yolo::INPUT_W * 3;
+    float* buffer_idx = (float*)buffers[inputIndex];
+
+    // allocate memory for res, resNum and waste
+    std::vector<DetectRes> res_vec(10);
+    int res_num = 0;
+    float waste_time = 0.0f;
+
+    //copy data to pinned memory
+    memcpy(img_host, img.data, size_image);
+
+    //copy data to device memory
+    CUDA_CHECK(cudaMemcpyAsync(img_device, img_host, size_image, cudaMemcpyHostToDevice, stream));
+    preprocess_kernel_img(img_device, img.cols, img.rows, buffer_idx, Yolo::INPUT_H, Yolo::INPUT_W, stream);
+
+    // Run inference
+    auto start = std::chrono::system_clock::now();
+    static float prob[BATCH_SIZE * OUTPUT_SIZE];
+    //std::cout<< "doInference..." <<std::endl;
+    doInference(*context, stream, (void**)buffers, prob, BATCH_SIZE);
+    auto end = std::chrono::system_clock::now();
+    waste_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    //std::cout << "inference time: " << waste_time << "ms" << std::endl;
+    std::vector<Yolo::Detection> result;
+    result.reserve(10);
+    nms(result, prob, CONF_THRESH, NMS_THRESH);
+    //std::cout << result.size() << std::endl;
+
+    int j = 0;
+    for (; j < result.size(); j++) {
+        cv::Rect r = get_rect(img, result[j].bbox);
+        cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 5);
+        cv::putText(img, std::to_string((int)result[j].class_id), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
+        DetectRes det(result[j].class_id, result[j].conf, Rect{r.x, r.y, r.width, r.height});
+        std::cout <<"label: "<< result[j].class_id << " confidence: " << result[j].conf <<std::endl;
+        res_vec[j] = det;
+    }
+    *resNum = j;
+    // assign the results to the output variables
+    std::copy(res_vec.begin(), res_vec.end(), res);
+    cv::imwrite("infer.jpg", img);
+    //*res = res_vec.data();
+    *waste = waste_time;
+
+    return 1;
 }
 
 
@@ -459,47 +640,35 @@ void reconnect(int i){
 }
 
 
-
-
-void Getbyte1(unsigned char *image, bool flag, int i, bool rotate)
+cv::Mat* GetMat(int i)
 {
-    //static int emptyFrameCount = 0;  // counter for consecutive empty frames
-    cv::Mat frame;
+    //static cv::Mat frame;
+    //cv::Mat frame = cam_map[i];
     if (videos[i].isOpened()) {
-        videos[i].read(frame);
-        if (frame.empty()) {
-            std::cout << "Input frame is empty." << std::endl;
-            emptyFrameCount[i]++;
-            if (emptyFrameCount[i] >= 3) {
-                std::cout << "5 consecutive empty frames detected. Reconnecting to cam " << i << "." <<  std::endl;
+        videos[i].read(cam_map[i]);
+        if (cam_map[i].empty()) {
+            std::cout << "Input frame is empty" << std::endl;
+            if (++emptyFrameCount[i] >= 3) {
+                std::cout << "5 consecutive empty frames detected. Reconnecting to cam" << i <<  std::endl;
                 videos[i].release();
                 reconnect(i);
-                emptyFrameCount[i] = 0;  // reset the counter after reconnecting
+                emptyFrameCount[i] = 0; 
             }
         } 
         else {
-            emptyFrameCount[i] = 0;  // reset the counter if a non-empty frame is received  
-            cam_map[i] = frame;       
-            if(flag){              
-                if(rotate){
-                  transpose(frame,frame);
-                  //cam_map[i] = frame;
-                }
-                memcpy(image, frame.data, (int)frame.cols * frame.rows * 3);
-            }
-            else{                
-                return;
-            }
-            
+            emptyFrameCount[i] = 0;               
+            //return &(cam_map[i]);   
+            return new cv::Mat(cam_map[i].clone());
         }
     } else {
-        std::cout << "Cam " << i << " link fail." <<  std::endl;
+        std::cout << "cam " << i << " link fail" <<  std::endl;
         videos[i].release();
         reconnect(i);
     }
-
-    //frame.release();
+    return nullptr;
 }
+
+
 
 void Getbyte(unsigned char *image, bool flag, int i, bool rotate)
 {
@@ -509,23 +678,17 @@ void Getbyte(unsigned char *image, bool flag, int i, bool rotate)
         if (frame.empty()) {
             std::cout << "Input frame is empty" << std::endl;
             if (++emptyFrameCount[i] >= 3) {
-                std::cout << "5 consecutive empty frames detected. Reconnecting to cam" << i << "。" <<  std::endl;
+                std::cout << "5 consecutive empty frames detected. Reconnecting to cam" << i <<  std::endl;
                 videos[i].release();
                 reconnect(i);
-                emptyFrameCount[i] = 0;  // 重连后重置计数器
+                emptyFrameCount[i] = 0; 
             }
         } 
         else {
-            emptyFrameCount[i] = 0;  // 收到非空帧时重置计数器
-            cam_map[i] = frame;       
-            if(flag){              
-                if(rotate){
-                  transpose(frame,frame);
-                  cam_map[i] = frame;
-                }
-                memcpy(image, frame.data, (int)frame.cols * frame.rows * 3);
-            }
-            return;   // 如果flag为false，直接返回
+            emptyFrameCount[i] = 0;  
+            cam_map[i] = frame;    
+            memcpy(image, frame.data, (int)frame.cols * frame.rows * 3);   
+            return;  
         }
     } else {
         std::cout << "cam " << i << " link fail" <<  std::endl;
@@ -533,6 +696,7 @@ void Getbyte(unsigned char *image, bool flag, int i, bool rotate)
         reconnect(i);
     }
 }
+
 
 void Getbyte_new(unsigned char *image, bool flag, int i, bool rotate)
 {
@@ -545,21 +709,20 @@ void Getbyte_new(unsigned char *image, bool flag, int i, bool rotate)
                 std::cout << "3 consecutive empty frames detected. Reconnecting to cam" << i << "," <<  std::endl;
                 videos[i].release();
                 reconnect(i);
-                emptyFrameCount[i] = 0;  // 重连后重置计数器
+                emptyFrameCount[i] = 0; 
             }
         } 
         else {
-            emptyFrameCount[i] = 0;  // 收到非空帧时重置计数器
+            emptyFrameCount[i] = 0;  
             if(flag){              
                 if(rotate){
                   transpose(frame,frame);
                 }
-                cam_map[i] = frame.clone(); // 使用clone方法复制图像
+                cam_map[i] = frame.clone(); 
 
-                // 将图像数据复制到image中
                 std::memcpy(image, cam_map[i].data, cam_map[i].total() * cam_map[i].elemSize());
             }
-            return;   // 如果flag为false，直接返回
+            return;   
         }
     } else {
         std::cout << "cam " << i << " link fail" <<  std::endl;
@@ -570,4 +733,3 @@ void Getbyte_new(unsigned char *image, bool flag, int i, bool rotate)
 
 
 
-'
