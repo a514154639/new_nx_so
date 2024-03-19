@@ -42,12 +42,13 @@ struct DetectRes{
 //typedef void (*CallBackFunc)(char* data, size_t frameh, size_t framew, size_t fstep, DetectRes* res, size_t resLen);
 
 EXTERN_C nvinfer1::IExecutionContext* infer_init(const ModelParam& model_param);
-//EXTERN_C nvinfer1::IExecutionContext* infer_init_640(const ModelParam& model_param);
+EXTERN_C nvinfer1::IExecutionContext* infer_init_640(const ModelParam& model_param);
 //int infer_set_callback(CallBackFunc func);
 //EXTERN_C int infer_run_one(cv::Mat mat, DetectRes* res, size_t *resNum, size_t *waste);
-EXTERN_C int infer_run_one(unsigned char *image1,int row, int clomn, DetectRes* res, int *resNum, float *waste, nvinfer1::IExecutionContext *context);
+//EXTERN_C int infer_run_one(unsigned char *image1,int row, int clomn, DetectRes* res, int *resNum, float *waste, nvinfer1::IExecutionContext *context);
 //EXTERN_C int infer_run_one_640(unsigned char *image1,int row, int clomn, DetectRes* res, int *resNum, float *waste, nvinfer1::IExecutionContext *context);
-EXTERN_C int infer_run_one_index(int index, DetectRes* res, int *resNum, float *waste, nvinfer1::IExecutionContext *context, int x);
+EXTERN_C int infer_run_one_640(cv::Mat &img, DetectRes* res, int *resNum, float *waste, nvinfer1::IExecutionContext *context);
+EXTERN_C int infer_run_one_index(cv::Mat &img, DetectRes* res, int *resNum, float *waste, nvinfer1::IExecutionContext *context);
 EXTERN_C void infer_release(nvinfer1::IExecutionContext *context);
 
 EXTERN_C void Init_uri(const char * uri,int i);
